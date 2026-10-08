@@ -1,0 +1,9 @@
+node_modules/
+out/
+photos/
+*.txt
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.msp

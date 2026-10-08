@@ -1,0 +1,17 @@
+{
+  "name": "matrix-sheets",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local file transfer through printable matrix sheets",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node matrix-sheets.mjs"
+  },
+  "dependencies": {
+    "sharp": "0.35.5",
+    "zxing-wasm": "3.1.5"
+  }
+}
