@@ -38,7 +38,7 @@ async function matrices() {
 }
 
 function argumentsOf(argv) {
-  const values = { pages: '3', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', monitor: '0', seconds: '0' };
+  const values = { pages: '3', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', monitor: '0', seconds: '0', 'scan-width': '3072' };
   const files = [];
   const switches = new Set(['show', 'force', 'help']);
   const allowed = new Set([...Object.keys(values), 'out', 'manifest', 'corners', 'transfer']);
@@ -283,6 +283,8 @@ async function restore(paths, values) {
   if (manifest && (!manifest.layout || !Array.isArray(manifest.tiles))) fail('Invalid manifest');
   const cornerMap = values.corners ? JSON.parse(await readFile(values.corners, 'utf8')) : null;
   if (cornerMap && !manifest) fail('--corners requires --manifest');
+  const scanWidth = integer(values['scan-width'], '--scan-width', 0, 8192);
+  if (scanWidth > 0 && scanWidth < 256) fail('--scan-width must be 0 or between 256 and 8192');
   const api = await matrices();
   const groups = new Map();
   const accept = results => {
@@ -297,13 +299,20 @@ async function restore(paths, values) {
       groups.set(frame.transfer, group);
     }
   };
-  const scan = async image => accept(await api.readBarcodes(rgba(image), { tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: false, maxNumberOfSymbols: 0 }));
+  const scan = async image => accept(await api.readBarcodes(rgba(image), { tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, maxNumberOfSymbols: 0 }));
   for (const file of files) {
-    const loaded = await sharp(file, { limitInputPixels: 80_000_000 }).rotate().removeAlpha().greyscale().raw().toBuffer({ resolveWithObject: true });
-    let image = { data: loaded.data, width: loaded.info.width, height: loaded.info.height };
     const points = cornerMap?.[basename(file)];
+    const pipeline = sharp(file, { limitInputPixels: 80_000_000 }).rotate().removeAlpha().greyscale();
+    if (scanWidth && !points) pipeline.resize({ width: scanWidth, height: scanWidth, fit: 'inside', withoutEnlargement: true });
+    const loaded = await pipeline.raw().toBuffer({ resolveWithObject: true });
+    let image = { data: loaded.data, width: loaded.info.width, height: loaded.info.height };
     if (points) image = rectify(image, points, integer(manifest.layout.width, 'manifest width', 128, 8192), integer(manifest.layout.height, 'manifest height', 128, 8192));
     await scan(image);
+    if (!points && scanWidth && Math.max(image.width, image.height) >= scanWidth) {
+      const side = Math.round(scanWidth * 2 / 3);
+      const smaller = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 1 } }).resize({ width: side, height: side, fit: 'inside', withoutEnlargement: true }).raw().toBuffer({ resolveWithObject: true });
+      await scan({ data: smaller.data, width: smaller.info.width, height: smaller.info.height });
+    }
     if (manifest && (points || image.width === manifest.layout.width && image.height === manifest.layout.height)) {
       const boxes = new Map(manifest.tiles.map(tile => [`${tile.x},${tile.y},${tile.size}`, tile]));
       for (const box of boxes.values()) {
@@ -405,7 +414,7 @@ node matrix-sheets.mjs restore photos --out restored.txt [--manifest out/manifes
 node matrix-sheets.mjs show out [--monitor 0 --seconds 0]
 Options: --pages N|auto --cell N|auto --level L|M|Q|H --width N --height N
          --version N|auto --compression auto|none|gzip|brotli
-         --transfer HEX --force --show --monitor N --seconds N --help`);
+         --scan-width N --transfer HEX --force --show --monitor N --seconds N --help`);
 }
 
 async function main() {
