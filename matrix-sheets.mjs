@@ -2,12 +2,11 @@ import { readFile, writeFile, readdir, mkdir, stat, access } from 'node:fs/promi
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync, brotliCompressSync, brotliDecompressSync, deflateSync, constants } from 'node:zlib';
-import { resolve, join, basename, extname } from 'node:path';
-import { spawn } from 'node:child_process';
-import sharp from 'sharp';
+import { resolve, join, basename } from 'node:path';
 
 const LIMIT = 32 * 1024 * 1024;
 const FRAME_SIZE = 28;
+const LABEL_HEIGHT = 32;
 const METHODS = ['none', 'gzip', 'brotli'];
 const CAPACITY = {
   L: [13,28,49,74,102,130,150,188,226,267,317,363,421,454,516,582,640,714,788,854,925,999,1087,1167,1269,1363,1461,1524,1624,1728,1836,1948,2064,2184,2299,2427,2559,2695,2805,2949],
@@ -28,17 +27,199 @@ const crc = bytes => {
 const json = value => console.log(JSON.stringify(value, null, 2));
 const fail = message => { throw new Error(message); };
 let engine;
+let imaging;
+
+const PARITY_SIZE = {
+  L: [7,10,15,20,26,18,20,24,30,18,20,24,26,30,22,24,28,30,28,28,28,28,30,30,26,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30],
+  M: [10,16,26,18,24,16,18,22,22,26,30,22,22,24,24,28,28,26,26,26,26,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28,28],
+  Q: [13,22,18,26,18,24,18,22,20,24,28,26,24,20,30,24,28,28,26,30,28,30,30,30,30,28,30,30,30,30,30,30,30,30,30,30,30,30,30,30],
+  H: [17,28,22,16,22,28,26,26,24,28,24,28,22,24,24,30,28,28,26,28,30,24,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30,30]
+};
+const GROUPS = {
+  L: [1,1,1,1,1,2,2,2,2,4,4,4,4,4,6,6,6,6,7,8,8,9,9,10,12,12,12,13,14,15,16,17,18,19,19,20,21,22,24,25],
+  M: [1,1,1,2,2,4,4,4,5,5,5,8,9,9,10,10,11,13,14,16,17,17,18,20,21,23,25,26,28,29,31,33,35,37,38,40,43,45,47,49],
+  Q: [1,1,2,2,4,4,6,6,8,8,8,10,12,16,12,17,16,18,21,20,23,23,25,27,29,34,34,35,38,40,43,45,48,51,53,56,59,62,65,68],
+  H: [1,1,2,4,4,4,5,6,8,8,11,11,16,16,18,16,19,21,25,25,25,34,30,32,35,37,40,42,45,48,51,54,57,60,63,66,70,74,77,81]
+};
+const POWERS = new Uint8Array(512);
+const LOGS = new Uint8Array(256);
+let field = 1;
+for (let i = 0; i < 255; i++) {
+  POWERS[i] = field;
+  LOGS[field] = i;
+  field <<= 1;
+  if (field & 256) field ^= 0x11d;
+}
+for (let i = 255; i < 512; i++) POWERS[i] = POWERS[i - 255];
+const product = (a, b) => a && b ? POWERS[LOGS[a] + LOGS[b]] : 0;
+
+function parityFor(bytes, degree) {
+  let polynomial = [1];
+  for (let i = 0; i < degree; i++) {
+    const next = new Uint8Array(polynomial.length + 1);
+    for (let j = 0; j < polynomial.length; j++) {
+      next[j] ^= polynomial[j];
+      next[j + 1] ^= product(polynomial[j], POWERS[i]);
+    }
+    polynomial = next;
+  }
+  const message = new Uint8Array(bytes.length + degree);
+  message.set(bytes);
+  for (let i = 0; i < bytes.length; i++) {
+    const factor = message[i];
+    for (let j = 1; factor && j < polynomial.length; j++) message[i + j] ^= product(factor, polynomial[j]);
+  }
+  return message.slice(bytes.length);
+}
+
+function scoreMatrix(pixels, size) {
+  let score = 0, dark = 0;
+  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
+    const value = pixels[y * size + x];
+    dark += value;
+    if (x && y && value === pixels[y * size + x - 1] && value === pixels[(y - 1) * size + x] && value === pixels[(y - 1) * size + x - 1]) score += 3;
+  }
+  for (let axis = 0; axis < 2; axis++) for (let line = 0; line < size; line++) {
+    let previous = -1, run = 0, window = 0;
+    for (let i = 0; i < size; i++) {
+      const value = pixels[axis ? i * size + line : line * size + i];
+      run = value === previous ? run + 1 : 1;
+      previous = value;
+      if (run === 5) score += 3;
+      if (run > 5) score++;
+      window = ((window << 1) | value) & 2047;
+      if (i >= 10 && (window === 0b10111010000 || window === 0b00001011101)) score += 40;
+    }
+  }
+  return score + Math.floor(Math.abs(dark * 20 - size * size * 10) / (size * size)) * 10;
+}
+
+function matrixFrom(bytes, version, level) {
+  const size = 17 + version * 4;
+  let pixels = new Uint8Array(size * size);
+  const fixed = new Uint8Array(pixels.length);
+  const set = (x, y, value) => {
+    if (x < 0 || y < 0 || x >= size || y >= size) return;
+    pixels[y * size + x] = Number(Boolean(value));
+    fixed[y * size + x] = 1;
+  };
+  for (let i = 0; i < size; i++) { set(6, i, i % 2 === 0); set(i, 6, i % 2 === 0); }
+  for (const [cx, cy] of [[3,3],[size - 4,3],[3,size - 4]]) {
+    for (let y = -4; y <= 4; y++) for (let x = -4; x <= 4; x++) {
+      const distance = Math.max(Math.abs(x), Math.abs(y));
+      set(cx + x, cy + y, distance !== 2 && distance !== 4);
+    }
+  }
+  if (version > 1) {
+    const count = Math.floor(version / 7) + 2;
+    const step = version === 32 ? 26 : Math.ceil((size - 13) / (count * 2 - 2)) * 2;
+    const positions = [6];
+    for (let i = count - 2; i >= 0; i--) positions.push(size - 7 - i * step);
+    for (let row = 0; row < count; row++) for (let column = 0; column < count; column++) {
+      if (row === 0 && (column === 0 || column === count - 1) || row === count - 1 && column === 0) continue;
+      for (let y = -2; y <= 2; y++) for (let x = -2; x <= 2; x++) set(positions[column] + x, positions[row] + y, Math.max(Math.abs(x), Math.abs(y)) !== 1);
+    }
+  }
+  const format = mask => {
+    const value = ({ L: 1, M: 0, Q: 3, H: 2 }[level] << 3) | mask;
+    let remainder = value;
+    for (let i = 0; i < 10; i++) remainder = (remainder << 1) ^ ((remainder & 512) ? 0x537 : 0);
+    const bits = ((value << 10) | remainder) ^ 0x5412;
+    const bit = i => (bits >>> i) & 1;
+    for (let i = 0; i < 6; i++) set(8, i, bit(i));
+    set(8, 7, bit(6)); set(8, 8, bit(7)); set(7, 8, bit(8));
+    for (let i = 9; i < 15; i++) set(14 - i, 8, bit(i));
+    for (let i = 0; i < 8; i++) set(size - 1 - i, 8, bit(i));
+    for (let i = 8; i < 15; i++) set(8, size - 15 + i, bit(i));
+    set(8, size - 8, 1);
+  };
+  format(0);
+  if (version >= 7) {
+    let remainder = version;
+    for (let i = 0; i < 12; i++) remainder = (remainder << 1) ^ ((remainder & 2048) ? 0x1f25 : 0);
+    const bits = (version << 12) | remainder;
+    for (let i = 0; i < 18; i++) {
+      const a = size - 11 + i % 3, b = Math.floor(i / 3);
+      set(a, b, (bits >>> i) & 1); set(b, a, (bits >>> i) & 1);
+    }
+  }
+  const rawBytes = Math.floor(fixed.reduce((total, value) => total + (value ? 0 : 1), 0) / 8);
+  const degree = PARITY_SIZE[level][version - 1], groups = GROUPS[level][version - 1];
+  const data = Buffer.alloc(rawBytes - degree * groups);
+  const countBits = version < 10 ? 8 : 16;
+  if (4 + countBits + bytes.length * 8 > data.length * 8) fail('Part exceeds matrix capacity');
+  let cursor = 0;
+  const append = (value, count) => {
+    for (let i = count - 1; i >= 0; i--) { if ((value >>> i) & 1) data[cursor >>> 3] |= 128 >>> (cursor & 7); cursor++; }
+  };
+  append(4, 4); append(bytes.length, countBits);
+  for (const byte of bytes) append(byte, 8);
+  cursor += Math.min(4, data.length * 8 - cursor);
+  cursor = Math.ceil(cursor / 8) * 8;
+  for (let pad = 0; cursor < data.length * 8; pad++) { data[cursor >>> 3] = pad % 2 ? 0x11 : 0xec; cursor += 8; }
+  const shortLength = Math.floor(rawBytes / groups) - degree;
+  const shortGroups = groups - rawBytes % groups;
+  const blocks = [], checks = [];
+  let offset = 0;
+  for (let i = 0; i < groups; i++) {
+    const length = shortLength + (i >= shortGroups ? 1 : 0);
+    const block = data.subarray(offset, offset + length);
+    offset += length;
+    blocks.push(block); checks.push(parityFor(block, degree));
+  }
+  const stream = [];
+  for (let i = 0; i <= shortLength; i++) for (const block of blocks) if (i < block.length) stream.push(block[i]);
+  for (let i = 0; i < degree; i++) for (const check of checks) stream.push(check[i]);
+  let index = 0;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vertical = 0; vertical < size; vertical++) {
+      const y = ((right + 1) & 2) === 0 ? size - 1 - vertical : vertical;
+      for (let column = 0; column < 2; column++) {
+        const position = y * size + right - column;
+        if (fixed[position]) continue;
+        pixels[position] = index < stream.length * 8 ? (stream[index >>> 3] >>> (7 - (index & 7))) & 1 : 0;
+        index++;
+      }
+    }
+  }
+  const masks = [
+    (x,y) => (x+y)%2 === 0, (x,y) => y%2 === 0, (x,y) => x%3 === 0, (x,y) => (x+y)%3 === 0,
+    (x,y) => (Math.floor(x/3)+Math.floor(y/2))%2 === 0, (x,y) => x*y%2+x*y%3 === 0,
+    (x,y) => (x*y%2+x*y%3)%2 === 0, (x,y) => ((x+y)%2+x*y%3)%2 === 0
+  ];
+  const base = pixels.slice();
+  let best, bestScore = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    pixels = base.slice();
+    for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) if (!fixed[y * size + x] && masks[mask](x,y)) pixels[y * size + x] ^= 1;
+    format(mask);
+    const score = scoreMatrix(pixels, size);
+    if (score < bestScore) { bestScore = score; best = pixels; }
+  }
+  return { data: Uint8Array.from(best, value => value ? 0 : 255), width: size, height: size };
+}
 
 async function matrices() {
   if (!engine) {
-    engine = await import('zxing-wasm/full');
-    engine.prepareZXingModule({ overrides: { wasmBinary: readFileSync(new URL(import.meta.resolve('zxing-wasm/full/zxing_full.wasm'))) } });
+    try {
+      engine = await import('zxing-wasm/reader');
+      engine.prepareZXingModule({ overrides: { wasmBinary: readFileSync(new URL(import.meta.resolve('zxing-wasm/reader/zxing_reader.wasm'))) } });
+    } catch (error) { fail(`Photo restoration dependencies are unavailable: ${error.message}. See README for installation.`); }
   }
   return engine;
 }
 
+async function images() {
+  if (!imaging) {
+    try { imaging = (await import('sharp')).default; }
+    catch (error) { fail(`Image loading dependency is unavailable: ${error.message}. See README for installation.`); }
+  }
+  return imaging;
+}
+
 function argumentsOf(argv) {
-  const values = { pages: '3', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', monitor: '0', seconds: '0', 'scan-width': '3072' };
+  const values = { pages: '3', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', 'scan-width': '3072' };
   const files = [];
   const switches = new Set(['show', 'force', 'help']);
   const allowed = new Set([...Object.keys(values), 'out', 'manifest', 'corners', 'transfer']);
@@ -99,8 +280,9 @@ function packetInfo(packet) {
 function layoutFor(length, values) {
   const width = integer(values.width, '--width', 128, 8192);
   const height = integer(values.height, '--height', 128, 8192);
+  const contentHeight = height - LABEL_HEIGHT;
   const pages = values.pages === 'auto' ? null : integer(values.pages, '--pages', 1, 1000);
-  const cells = values.cell === 'auto' ? Array.from({ length: Math.floor(Math.min(width, height) / 29) - 1 }, (_, i) => i + 2) : [integer(values.cell, '--cell', 1, 256)];
+  const cells = values.cell === 'auto' ? Array.from({ length: Math.floor(Math.min(width, contentHeight) / 29) - 1 }, (_, i) => i + 2) : [integer(values.cell, '--cell', 1, 256)];
   const versions = values.version === 'auto' ? Array.from({ length: 40 }, (_, i) => i + 1) : [integer(values.version, '--version', 1, 40)];
   const level = String(values.level).toUpperCase();
   if (!CAPACITY[level]) fail('--level must be L, M, Q or H');
@@ -108,14 +290,14 @@ function layoutFor(length, values) {
   for (const cell of cells) for (const version of versions) {
     const tile = (25 + 4 * version) * cell;
     const columns = Math.floor(width / tile);
-    const rows = Math.floor(height / tile);
+    const rows = Math.floor(contentHeight / tile);
     const payload = CAPACITY[level][version - 1] - FRAME_SIZE;
     if (!columns || !rows || payload < 1) continue;
     const parts = Math.max(pages ?? 1, Math.ceil(length / payload));
     if (parts > 65535 || parts > length) continue;
     const naturalPages = Math.ceil(parts / (columns * rows));
     if (pages && naturalPages > pages) continue;
-    choices.push({ width, height, pages: pages ?? naturalPages, cell, version, level, tile, columns, rows, parts, partBytes: payload, bytesPerPage: columns * rows * payload });
+    choices.push({ width, height, contentHeight, labelHeight: LABEL_HEIGHT, pages: pages ?? naturalPages, cell, version, level, tile, columns, rows, parts, partBytes: payload, bytesPerPage: columns * rows * payload });
   }
   choices.sort((a, b) => a.pages - b.pages || b.cell - a.cell || a.parts - b.parts || a.version - b.version);
   if (!choices.length) fail('The package does not fit. Increase --pages, or use --pages auto --cell 3.');
@@ -164,6 +346,28 @@ function pngFrom(pixels, width, height) {
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), pngChunk('IHDR', header), pngChunk('IDAT', deflateSync(scanlines, { level: 9 })), pngChunk('IEND', Buffer.alloc(0))]);
 }
 
+function numberPage(pixels, width, height, page, total) {
+  const glyphs = {
+    '0': ['111','101','101','101','111'], '1': ['010','110','010','010','111'],
+    '2': ['111','001','111','100','111'], '3': ['111','001','111','001','111'],
+    '4': ['101','101','111','001','001'], '5': ['111','100','111','001','111'],
+    '6': ['111','100','111','101','111'], '7': ['111','001','010','010','010'],
+    '8': ['111','101','111','101','111'], '9': ['111','101','111','001','111'],
+    '/': ['001','001','010','100','100'], ' ': ['000','000','000','000','000']
+  };
+  const label = `${page} / ${total}`;
+  const scale = Math.min(3, Math.floor(width / (label.length * 4 - 1)));
+  const left = Math.floor((width - (label.length * 4 - 1) * scale) / 2);
+  const top = height - LABEL_HEIGHT + Math.floor((LABEL_HEIGHT - 5 * scale) / 2);
+  for (let i = 0; i < label.length; i++) for (let row = 0; row < 5; row++) for (let column = 0; column < 3; column++) {
+    if (glyphs[label[i]][row][column] !== '1') continue;
+    for (let dy = 0; dy < scale; dy++) {
+      const start = (top + row * scale + dy) * width + left + (i * 4 + column) * scale;
+      pixels.fill(0, start, start + scale);
+    }
+  }
+}
+
 async function pack(input, values, dry = false) {
   const { packet, info } = await packetFrom(input, values.compression);
   const layout = layoutFor(packet.length, values);
@@ -172,20 +376,17 @@ async function pack(input, values, dry = false) {
   const output = resolve(values.out ?? 'out');
   try { if ((await readdir(output)).length) fail('Output directory is not empty'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   await mkdir(output, { recursive: true });
-  const api = await matrices();
   const images = [];
   const tiles = [];
   const left = Math.floor((layout.width - layout.columns * layout.tile) / 2);
-  const top = Math.floor((layout.height - layout.rows * layout.tile) / 2);
+  const top = Math.floor((layout.contentHeight - layout.rows * layout.tile) / 2);
   for (let page = 0; page < layout.pages; page++) {
     const pixels = Buffer.alloc(layout.width * layout.height, 255);
     const first = Math.floor(page * layout.parts / layout.pages);
     const end = Math.floor((page + 1) * layout.parts / layout.pages);
     for (let index = first; index < end; index++) {
       const frame = frameFor(packet, index, layout.parts);
-      const rendered = await api.writeBarcode(frame, { options: `version=${layout.version},ecLevel=${layout.level}`, scale: 1, addQuietZones: false });
-      if (rendered.error || rendered.symbol.width !== 17 + 4 * layout.version) fail(rendered.error || 'Unexpected matrix dimensions');
-      const symbol = rendered.symbol;
+      const symbol = matrixFrom(frame, layout.version, layout.level);
       const slot = index - first;
       const x = left + (slot % layout.columns) * layout.tile;
       const y = top + Math.floor(slot / layout.columns) * layout.tile;
@@ -199,6 +400,7 @@ async function pack(input, values, dry = false) {
       tiles.push({ page: page + 1, index, x, y, size: layout.tile });
     }
     const name = `sheet-${String(page + 1).padStart(3, '0')}.png`;
+    numberPage(pixels, layout.width, layout.height, page + 1, layout.pages);
     await writeFile(join(output, name), pngFrom(pixels, layout.width, layout.height));
     images.push(name);
     console.error(`Saved ${name} (${end - first} parts)`);
@@ -286,6 +488,7 @@ async function restore(paths, values) {
   const scanWidth = integer(values['scan-width'], '--scan-width', 0, 8192);
   if (scanWidth > 0 && scanWidth < 256) fail('--scan-width must be 0 or between 256 and 8192');
   const api = await matrices();
+  const sharp = await images();
   const groups = new Map();
   const accept = results => {
     for (const result of results) {
@@ -348,62 +551,12 @@ async function restore(paths, values) {
   json({ output, ...info, verified: true });
 }
 
-async function show(directory, values) {
-  if (process.platform !== 'win32') fail('show is available on Windows; open PNG files in a fullscreen viewer');
+async function show(directory) {
   const manifest = JSON.parse(await readFile(join(directory, 'manifest.json'), 'utf8'));
-  const monitor = integer(values.monitor, '--monitor', 0, 15);
-  const seconds = integer(values.seconds, '--seconds', 0, 3600);
   if (!Array.isArray(manifest.images) || !manifest.images.length || manifest.images.some(name => basename(name) !== name)) fail('Invalid image list');
-  const script = String.raw`
-$ErrorActionPreference = 'Stop'
-$settings = [Console]::In.ReadToEnd() | ConvertFrom-Json
-Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ScreenDpi { [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value); }'
-[ScreenDpi]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-$screens = [System.Windows.Forms.Screen]::AllScreens
-if ($settings.monitor -ge $screens.Length) { throw 'Monitor index is unavailable' }
-$bounds = $screens[$settings.monitor].Bounds
-$form = New-Object System.Windows.Forms.Form
-$form.FormBorderStyle = 'None'
-$form.StartPosition = 'Manual'
-$form.AutoScaleMode = 'None'
-$form.Bounds = $bounds
-$form.BackColor = [System.Drawing.Color]::White
-$form.KeyPreview = $true
-$box = New-Object System.Windows.Forms.PictureBox
-$box.Dock = 'Fill'
-$box.SizeMode = 'CenterImage'
-$form.Controls.Add($box)
-$script:position = 0
-$script:images = @($settings.files | ForEach-Object { [System.Drawing.Image]::FromFile($_) })
-foreach ($image in $script:images) { if ($image.Width -gt $bounds.Width -or $image.Height -gt $bounds.Height) { throw 'A sheet exceeds the selected monitor; generate matching dimensions' } }
-$box.Image = $script:images[0]
-$form.Text = 'Matrix Sheets 1/' + $script:images.Length
-$form.Add_KeyDown({
-  if ($_.KeyCode -eq 'Escape') { $form.Close(); return }
-  if ($_.KeyCode -in @('Right','Space','PageDown')) { $script:position = ($script:position + 1) % $script:images.Length }
-  if ($_.KeyCode -in @('Left','PageUp')) { $script:position = ($script:position - 1 + $script:images.Length) % $script:images.Length }
-  $box.Image = $script:images[$script:position]
-  $form.Text = 'Matrix Sheets ' + ($script:position + 1) + '/' + $script:images.Length
-})
-$timer = New-Object System.Windows.Forms.Timer
-if ($settings.seconds -gt 0) {
-  $timer.Interval = $settings.seconds * 1000
-  $timer.Add_Tick({ $script:position = ($script:position + 1) % $script:images.Length; $box.Image = $script:images[$script:position]; $form.Text = 'Matrix Sheets ' + ($script:position + 1) + '/' + $script:images.Length })
-  $timer.Start()
-}
-$form.Add_Shown({ $form.Activate() })
-[System.Windows.Forms.Application]::Run($form)
-$timer.Dispose()
-foreach ($image in $script:images) { $image.Dispose() }
-$form.Dispose()
-`;
-  console.error('Right/Space: next; Left: previous; Esc: close');
-  const executable = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const child = spawn(executable, ['-NoProfile', '-STA', '-Command', script], { windowsHide: true, stdio: ['pipe', 'inherit', 'inherit'] });
-  child.stdin.end(JSON.stringify({ files: manifest.images.map(name => join(resolve(directory), name)), monitor, seconds }));
-  await new Promise((done, reject) => { child.once('error', reject); child.once('exit', status => status === 0 ? done() : reject(new Error(`Viewer exited with status ${status}`))); });
+  const files = manifest.images.map(name => join(resolve(directory), name));
+  for (const file of files) if (!(await stat(file)).isFile()) fail('A sheet is unavailable');
+  json({ images: files, viewing: 'Open the PNG files in an approved image viewer at 100% scale.' });
 }
 
 function help() {
@@ -411,10 +564,10 @@ function help() {
 node matrix-sheets.mjs inspect input.txt [--pages 3 --cell auto --level Q]
 node matrix-sheets.mjs pack input.txt --out out [--pages 3 --cell auto --level Q --show]
 node matrix-sheets.mjs restore photos --out restored.txt [--manifest out/manifest.json --corners corners.json]
-node matrix-sheets.mjs show out [--monitor 0 --seconds 0]
+node matrix-sheets.mjs show out
 Options: --pages N|auto --cell N|auto --level L|M|Q|H --width N --height N
          --version N|auto --compression auto|none|gzip|brotli
-         --scan-width N --transfer HEX --force --show --monitor N --seconds N --help`);
+         --scan-width N --transfer HEX --force --show --help`);
 }
 
 async function main() {
