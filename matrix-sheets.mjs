@@ -219,7 +219,8 @@ async function images() {
 }
 
 function argumentsOf(argv) {
-  const values = { pages: '3', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', 'scan-width': '3072' };
+  const values = { pages: 'auto', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', 'scan-width': '3072' };
+  const explicit = new Set();
   const files = [];
   const switches = new Set(['show', 'force', 'help']);
   const allowed = new Set([...Object.keys(values), 'out', 'manifest', 'corners', 'transfer']);
@@ -234,8 +235,9 @@ function argumentsOf(argv) {
       if (value === undefined || value.startsWith('--')) fail(`Missing value for --${name}`);
       values[name] = value;
     } else fail(`Unknown argument: ${item}`);
+    explicit.add(name);
   }
-  return { values, files };
+  return { values, files, explicit };
 }
 
 function integer(value, name, min, max) {
@@ -264,8 +266,38 @@ async function packetFrom(path, method) {
   header.writeUInt16BE(name.length, 41);
   const packet = Buffer.concat([header, name, payload]);
   const info = packetInfo(packet);
+  Object.assign(info, textInfo(source));
   info.candidates = Object.fromEntries([...candidates].map(([key, value]) => [METHODS[key], value.length]));
   return { packet, info };
+}
+
+function textInfo(source) {
+  let format = 'UTF-8';
+  if (source.length >= 2 && source[0] === 255 && source[1] === 254) format = 'UTF-16LE';
+  if (source.length >= 2 && source[0] === 254 && source[1] === 255) format = 'UTF-16BE';
+  let text;
+  try { text = new TextDecoder(format, { fatal: true }).decode(source); }
+  catch { return { characters: null, textFormat: null }; }
+  let characters = 0;
+  for (const character of text) characters++;
+  return { characters, textFormat: format };
+}
+
+function generationFor(length, info, values, explicit) {
+  const profile = info.characters === null ? 'binary' : info.characters <= 10000 ? 'small' : info.characters <= 50000 ? 'medium' : 'large';
+  const chosen = { ...values };
+  if (!explicit.has('pages')) chosen.pages = profile === 'small' && !explicit.has('cell') ? '1' : 'auto';
+  if (!explicit.has('cell')) chosen.cell = explicit.has('pages') || profile === 'small' ? 'auto' : profile === 'medium' ? '4' : '3';
+  let layout = layoutFor(length, chosen);
+  let singlePageFallback = false;
+  if (!layout && chosen.pages === '1' && !explicit.has('pages')) {
+    chosen.pages = 'auto';
+    chosen.cell = '4';
+    singlePageFallback = true;
+    layout = layoutFor(length, chosen);
+  }
+  if (!layout) fail('The package does not fit. Increase --pages, or use --pages auto with a cell size that fits the sheet.');
+  return { layout, generation: { profile, pages: chosen.pages, cell: chosen.cell, overrides: [...explicit].filter(name => name === 'pages' || name === 'cell'), singlePageFallback } };
 }
 
 function packetInfo(packet) {
@@ -300,7 +332,6 @@ function layoutFor(length, values) {
     choices.push({ width, height, contentHeight, labelHeight: LABEL_HEIGHT, pages: pages ?? naturalPages, cell, version, level, tile, columns, rows, parts, partBytes: payload, bytesPerPage: columns * rows * payload });
   }
   choices.sort((a, b) => a.pages - b.pages || b.cell - a.cell || a.parts - b.parts || a.version - b.version);
-  if (!choices.length) fail('The package does not fit. Increase --pages, or use --pages auto --cell 3.');
   return choices[0];
 }
 
@@ -368,9 +399,10 @@ function numberPage(pixels, width, height, page, total) {
   }
 }
 
-async function pack(input, values, dry = false) {
+async function pack(input, values, dry = false, explicit = new Set()) {
   const { packet, info } = await packetFrom(input, values.compression);
-  const layout = layoutFor(packet.length, values);
+  const { layout, generation } = generationFor(packet.length, info, values, explicit);
+  info.generation = generation;
   json({ ...info, layout });
   if (dry) return;
   const output = resolve(values.out ?? 'out');
@@ -561,10 +593,12 @@ async function show(directory) {
 
 function help() {
   console.log(`Matrix Sheets
-node matrix-sheets.mjs inspect input.txt [--pages 3 --cell auto --level Q]
-node matrix-sheets.mjs pack input.txt --out out [--pages 3 --cell auto --level Q --show]
+node matrix-sheets.mjs inspect input.txt [--pages N|auto --cell N|auto --level Q]
+node matrix-sheets.mjs pack input.txt --out out [--pages N|auto --cell N|auto --level Q --show]
 node matrix-sheets.mjs restore photos --out restored.txt [--manifest out/manifest.json --corners corners.json]
 node matrix-sheets.mjs show out
+Defaults: text size selects the cell size; compressed size determines the number of sheets.
+          Explicit --pages and --cell values take priority.
 Options: --pages N|auto --cell N|auto --level L|M|Q|H --width N --height N
          --version N|auto --compression auto|none|gzip|brotli
          --scan-width N --transfer HEX --force --show --help`);
@@ -572,10 +606,10 @@ Options: --pages N|auto --cell N|auto --level L|M|Q|H --width N --height N
 
 async function main() {
   const [command, ...argv] = process.argv.slice(2);
-  const { values, files } = argumentsOf(argv);
+  const { values, files, explicit } = argumentsOf(argv);
   if (!command || command === 'help' || command === '--help' || values.help) return help();
   if (['pack', 'inspect', 'show'].includes(command) && files.length !== 1) fail(`${command} requires one input path`);
-  if (command === 'pack' || command === 'inspect') return pack(files[0], values, command === 'inspect');
+  if (command === 'pack' || command === 'inspect') return pack(files[0], values, command === 'inspect', explicit);
   if (command === 'restore') { if (!files.length) fail('restore requires images or a directory'); return restore(files, values); }
   if (command === 'show') return show(files[0], values);
   fail(`Unknown command: ${command}`);
