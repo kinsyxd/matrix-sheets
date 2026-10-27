@@ -4,16 +4,11 @@ import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync, brotliCompressSync, brotliDecompressSync, deflateSync, constants } from 'node:zlib';
 import { resolve, join, basename } from 'node:path';
 
+const APP_VERSION = '2.3.0';
 const LIMIT = 32 * 1024 * 1024;
 const FRAME_SIZE = 28;
 const LABEL_HEIGHT = 32;
 const METHODS = ['none', 'gzip', 'brotli'];
-const CAPACITY = {
-  L: [13,28,49,74,102,130,150,188,226,267,317,363,421,454,516,582,640,714,788,854,925,999,1087,1167,1269,1363,1461,1524,1624,1728,1836,1948,2064,2184,2299,2427,2559,2695,2805,2949],
-  M: [10,22,38,58,80,102,118,148,176,209,247,283,327,358,408,446,500,556,620,662,707,775,853,907,993,1055,1121,1186,1260,1366,1448,1534,1624,1718,1805,1907,1985,2095,2209,2327],
-  Q: [7,16,28,42,56,70,82,104,126,147,173,199,237,254,288,318,360,390,438,478,505,561,607,657,711,747,801,864,904,978,1026,1108,1164,1224,1279,1347,1419,1495,1575,1659],
-  H: [3,10,20,30,40,54,60,80,94,115,133,151,173,190,216,246,276,306,334,378,399,435,457,507,531,589,621,654,694,738,786,838,894,954,979,1047,1089,1135,1215,1269]
-};
 const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
   for (let i = 0; i < 8; i++) n = (n >>> 1) ^ ((n & 1) ? 0xedb88320 : 0);
   return n >>> 0;
@@ -219,10 +214,10 @@ async function images() {
 }
 
 function argumentsOf(argv) {
-  const values = { pages: 'auto', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', 'scan-width': '3072' };
+  const values = { pages: 'auto', cell: 'auto', level: 'Q', width: '1920', height: '1080', compression: 'auto', version: 'auto', 'scan-width': '3072', preset: 'standard', layers: 'auto' };
   const explicit = new Set();
   const files = [];
-  const switches = new Set(['show', 'force', 'help']);
+  const switches = new Set(['show', 'force', 'help', 'compare']);
   const allowed = new Set([...Object.keys(values), 'out', 'manifest', 'corners', 'transfer']);
   for (let i = 0; i < argv.length; i++) {
     const item = argv[i];
@@ -283,21 +278,36 @@ function textInfo(source) {
   return { characters, textFormat: format };
 }
 
-function generationFor(length, info, values, explicit) {
-  const profile = info.characters === null ? 'binary' : info.characters <= 10000 ? 'small' : info.characters <= 50000 ? 'medium' : 'large';
-  const chosen = { ...values };
-  if (!explicit.has('pages')) chosen.pages = profile === 'small' && !explicit.has('cell') ? '1' : 'auto';
-  if (!explicit.has('cell')) chosen.cell = explicit.has('pages') || profile === 'small' ? 'auto' : profile === 'medium' ? '4' : '3';
-  let layout = layoutFor(length, chosen);
-  let singlePageFallback = false;
-  if (!layout && chosen.pages === '1' && !explicit.has('pages')) {
-    chosen.pages = 'auto';
-    chosen.cell = '4';
-    singlePageFallback = true;
-    layout = layoutFor(length, chosen);
+class LayoutError extends Error {}
+
+function byteCapacity(version, level) {
+  let modules = (16 * version + 128) * version + 64;
+  if (version >= 2) {
+    const alignments = Math.floor(version / 7) + 2;
+    modules -= (25 * alignments - 10) * alignments - 55;
+    if (version >= 7) modules -= 36;
   }
-  if (!layout) fail('The package does not fit. Increase --pages, or use --pages auto with a cell size that fits the sheet.');
-  return { layout, generation: { profile, pages: chosen.pages, cell: chosen.cell, overrides: [...explicit].filter(name => name === 'pages' || name === 'cell'), singlePageFallback } };
+  const dataBytes = Math.floor(modules / 8) - PARITY_SIZE[level][version - 1] * GROUPS[level][version - 1];
+  return Math.floor((dataBytes * 8 - 4 - (version < 10 ? 8 : 16)) / 8);
+}
+
+function generationFor(length, info, values, explicit = new Set()) {
+  const preset = values.preset ?? 'standard';
+  if (!['standard', 'dense-experimental', 'color-experimental'].includes(preset)) fail('Invalid --preset');
+  if (explicit.has('layers') && preset !== 'color-experimental') fail('--layers requires --preset color-experimental');
+  const chosen = { ...values, preset };
+  if (preset === 'dense-experimental') {
+    if (!explicit.has('cell')) chosen.cell = '2';
+    if (!explicit.has('level')) chosen.level = 'L';
+  }
+  const layers = preset === 'color-experimental' ? (chosen.layers === 'auto' || chosen.layers === undefined ? [2, 3] : [integer(chosen.layers, '--layers', 2, 3)]) : [1];
+  const layouts = layers.map(layers => layoutFor(length, { ...chosen, layers })).filter(Boolean).sort(compareLayouts);
+  if (!layouts.length) throw new LayoutError('The package does not fit. Increase --pages, or use --pages auto with a cell size that fits the sheet.');
+  return { layout: layouts[0], generation: { preset, experimental: preset !== 'standard', pages: chosen.pages, cell: chosen.cell, overrides: [...explicit], optimization: preset === 'color-experimental' ? 'pages,cell,layers,parts,physicalTiles,version' : 'pages,cell,parts,physicalTiles,version' } };
+}
+
+function compareLayouts(a, b) {
+  return a.pages - b.pages || b.cell - a.cell || a.layers - b.layers || a.parts - b.parts || a.physicalTiles - b.physicalTiles || a.version - b.version;
 }
 
 function packetInfo(packet) {
@@ -312,27 +322,53 @@ function packetInfo(packet) {
 function layoutFor(length, values) {
   const width = integer(values.width, '--width', 128, 8192);
   const height = integer(values.height, '--height', 128, 8192);
-  const contentHeight = height - LABEL_HEIGHT;
+  const layers = values.layers === 'auto' ? 1 : Number(values.layers ?? 1), color = layers > 1;
+  const labelHeight = color ? 64 : LABEL_HEIGHT, contentHeight = height - labelHeight;
   const pages = values.pages === 'auto' ? null : integer(values.pages, '--pages', 1, 1000);
-  const cells = values.cell === 'auto' ? Array.from({ length: Math.floor(Math.min(width, contentHeight) / 29) - 1 }, (_, i) => i + 2) : [integer(values.cell, '--cell', 1, 256)];
+  const minimumCell = color ? 3 : 2;
+  const cells = values.cell === 'auto' ? Array.from({ length: Math.max(0, Math.floor(Math.min(width, contentHeight) / 29) - minimumCell + 1) }, (_, i) => i + minimumCell) : [integer(values.cell, '--cell', color ? 2 : 1, 256)];
   const versions = values.version === 'auto' ? Array.from({ length: 40 }, (_, i) => i + 1) : [integer(values.version, '--version', 1, 40)];
   const level = String(values.level).toUpperCase();
-  if (!CAPACITY[level]) fail('--level must be L, M, Q or H');
+  if (!PARITY_SIZE[level]) fail('--level must be L, M, Q or H');
   const choices = [];
   for (const cell of cells) for (const version of versions) {
     const tile = (25 + 4 * version) * cell;
-    const columns = Math.floor(width / tile);
-    const rows = Math.floor(contentHeight / tile);
-    const payload = CAPACITY[level][version - 1] - FRAME_SIZE;
+    const columns = Math.floor(width / tile), rows = Math.floor(contentHeight / tile);
+    const payload = byteCapacity(version, level) - FRAME_SIZE;
     if (!columns || !rows || payload < 1) continue;
     const parts = Math.max(pages ?? 1, Math.ceil(length / payload));
     if (parts > 65535 || parts > length) continue;
-    const naturalPages = Math.ceil(parts / (columns * rows));
+    const physicalTiles = Math.max(pages ?? 1, Math.ceil(parts / layers));
+    const naturalPages = Math.ceil(physicalTiles / (columns * rows));
     if (pages && naturalPages > pages) continue;
-    choices.push({ width, height, contentHeight, labelHeight: LABEL_HEIGHT, pages: pages ?? naturalPages, cell, version, level, tile, columns, rows, parts, partBytes: payload, bytesPerPage: columns * rows * payload });
+    choices.push({ width, height, contentHeight, labelHeight, pages: pages ?? naturalPages, cell, version, level, tile, columns, rows, parts, physicalTiles, layers, preset: values.preset ?? 'standard', experimental: (values.preset ?? 'standard') !== 'standard', codec: color ? 'rgb-bitplanes-v1' : 'mono-qr', palette: color ? paletteFor(layers) : null, partBytes: payload, bytesPerPage: columns * rows * layers * payload });
   }
-  choices.sort((a, b) => a.pages - b.pages || b.cell - a.cell || a.parts - b.parts || a.version - b.version);
-  return choices[0];
+  choices.sort(compareLayouts);
+  const layout = choices[0];
+  if (layout) layout.pagePlan = pagePlanFor(layout);
+  return layout;
+}
+
+function paletteFor(layers) {
+  return Array.from({ length: 1 << layers }, (_, mask) => [0, 1, 2].map(channel => (mask & (1 << (channel < layers ? channel : 1))) ? 0 : 255));
+}
+
+function pagePlanFor(layout) {
+  const result = [], capacity = layout.columns * layout.rows;
+  const left = Math.floor((layout.width - layout.columns * layout.tile) / 2), top = Math.floor((layout.contentHeight - layout.rows * layout.tile) / 2);
+  let remainingParts = layout.parts, remainingTiles = layout.physicalTiles, index = 0;
+  for (let page = 1; page <= layout.pages; page++) {
+    const count = Math.min(capacity, remainingTiles - (layout.pages - page)), tiles = [];
+    for (let slot = 0; slot < count; slot++) {
+      const partCount = Math.min(layout.layers, remainingParts - (remainingTiles - 1));
+      const indices = Array.from({ length: partCount }, () => index++);
+      const paddingIndices = Array.from({ length: layout.layers - partCount }, () => indices[indices.length - 1]);
+      tiles.push({ page, index: indices[0], indices, paddingIndices, x: left + slot % layout.columns * layout.tile, y: top + Math.floor(slot / layout.columns) * layout.tile, size: layout.tile });
+      remainingParts -= partCount; remainingTiles--;
+    }
+    result.push({ page, tiles, parts: tiles.reduce((sum, tile) => sum + tile.indices.length, 0), physicalTiles: tiles.length });
+  }
+  return result;
 }
 
 function frameFor(packet, index, total) {
@@ -353,8 +389,8 @@ function parseFrame(bytes) {
   const index = frame.readUInt16BE(20);
   const total = frame.readUInt16BE(22);
   const chunk = frame.subarray(FRAME_SIZE);
-  if (!total || index >= total || !chunk.length) fail('Invalid part metadata');
-  if (frame.readUInt32BE(24) !== crc(Buffer.concat([frame.subarray(0, 24), chunk]))) fail('A part failed CRC32 verification');
+  if (!total || index >= total || !chunk.length) return null;
+  if (frame.readUInt32BE(24) !== crc(Buffer.concat([frame.subarray(0, 24), chunk]))) return null;
   return { transfer: frame.subarray(4, 20).toString('hex'), index, total, chunk };
 }
 
@@ -367,13 +403,15 @@ function pngChunk(type, bytes) {
   return Buffer.concat([length, label, bytes, checksum]);
 }
 
-function pngFrom(pixels, width, height) {
+function pngFrom(pixels, width, height, channels = 1) {
   const header = Buffer.alloc(13);
   header.writeUInt32BE(width, 0);
   header.writeUInt32BE(height, 4);
   header[8] = 8;
-  const scanlines = Buffer.alloc((width + 1) * height);
-  for (let y = 0; y < height; y++) pixels.copy(scanlines, y * (width + 1) + 1, y * width, (y + 1) * width);
+  header[9] = channels === 3 ? 2 : 0;
+  const stride = width * channels;
+  const scanlines = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) pixels.copy(scanlines, y * (stride + 1) + 1, y * stride, (y + 1) * stride);
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), pngChunk('IHDR', header), pngChunk('IDAT', deflateSync(scanlines, { level: 9 })), pngChunk('IEND', Buffer.alloc(0))]);
 }
 
@@ -401,43 +439,58 @@ function numberPage(pixels, width, height, page, total) {
 
 async function pack(input, values, dry = false, explicit = new Set()) {
   const { packet, info } = await packetFrom(input, values.compression);
-  const { layout, generation } = generationFor(packet.length, info, values, explicit);
-  info.generation = generation;
-  json({ ...info, layout });
+  let layout, generation, selectedError;
+  try { ({ layout, generation } = generationFor(packet.length, info, values, explicit)); }
+  catch (error) {
+    if (!(dry && values.compare && error instanceof LayoutError)) throw error;
+    layout = null; selectedError = error.message;
+  }
+  if (generation) info.generation = generation;
+  const comparisons = values.compare ? Object.fromEntries(['standard', 'dense-experimental', 'color-experimental'].map(preset => {
+    try {
+      const flags = new Set(explicit); flags.delete('preset'); flags.delete('layers');
+      const result = generationFor(packet.length, info, { ...values, preset, layers: preset === 'color-experimental' ? values.layers : 'auto' }, flags);
+      return [preset, { ...result.layout, constraints: { overrides: [...explicit], minimumAutomaticCell: preset === 'color-experimental' ? 3 : 2 } }];
+    } catch (error) { return [preset, { feasible: false, reason: error.message }]; }
+  })) : undefined;
+  json({ ...info, layout, ...(selectedError ? { selectedError } : {}), ...(comparisons ? { compare: comparisons } : {}) });
   if (dry) return;
   const output = resolve(values.out ?? 'out');
   try { if ((await readdir(output)).length) fail('Output directory is not empty'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   await mkdir(output, { recursive: true });
-  const images = [];
-  const tiles = [];
-  const left = Math.floor((layout.width - layout.columns * layout.tile) / 2);
-  const top = Math.floor((layout.contentHeight - layout.rows * layout.tile) / 2);
-  for (let page = 0; page < layout.pages; page++) {
-    const pixels = Buffer.alloc(layout.width * layout.height, 255);
-    const first = Math.floor(page * layout.parts / layout.pages);
-    const end = Math.floor((page + 1) * layout.parts / layout.pages);
-    for (let index = first; index < end; index++) {
-      const frame = frameFor(packet, index, layout.parts);
-      const symbol = matrixFrom(frame, layout.version, layout.level);
-      const slot = index - first;
-      const x = left + (slot % layout.columns) * layout.tile;
-      const y = top + Math.floor(slot / layout.columns) * layout.tile;
-      for (let row = 0; row < symbol.height; row++) for (let column = 0; column < symbol.width; column++) {
-        if (symbol.data[row * symbol.width + column] >= 128) continue;
-        for (let dy = 0; dy < layout.cell; dy++) {
-          const start = (y + (row + 4) * layout.cell + dy) * layout.width + x + (column + 4) * layout.cell;
-          pixels.fill(0, start, start + layout.cell);
+  const images = [], tiles = layout.pagePlan.flatMap(page => page.tiles), channels = layout.layers > 1 ? 3 : 1;
+  for (const page of layout.pagePlan) {
+    const pixels = Buffer.alloc(layout.width * layout.height * channels, 255);
+    for (const tile of page.tiles) {
+      const symbols = [...tile.indices, ...tile.paddingIndices].map(index => matrixFrom(frameFor(packet, index, layout.parts), layout.version, layout.level));
+      for (let row = 0; row < symbols[0].height; row++) for (let column = 0; column < symbols[0].width; column++) {
+        let mask = 0;
+        for (let layer = 0; layer < symbols.length; layer++) if (symbols[layer].data[row * symbols[layer].width + column] < 128) mask |= 1 << layer;
+        const color = channels === 1 ? [mask ? 0 : 255] : layout.palette[mask];
+        for (let dy = 0; dy < layout.cell; dy++) for (let dx = 0; dx < layout.cell; dx++) {
+          const start = ((tile.y + (row + 4) * layout.cell + dy) * layout.width + tile.x + (column + 4) * layout.cell + dx) * channels;
+          for (let channel = 0; channel < channels; channel++) pixels[start + channel] = color[channel];
         }
       }
-      tiles.push({ page: page + 1, index, x, y, size: layout.tile });
     }
-    const name = `sheet-${String(page + 1).padStart(3, '0')}.png`;
-    numberPage(pixels, layout.width, layout.height, page + 1, layout.pages);
-    await writeFile(join(output, name), pngFrom(pixels, layout.width, layout.height));
+    const footer = Buffer.alloc(layout.width * layout.height, 255);
+    numberPage(footer, layout.width, layout.height, page.page, layout.pages);
+    for (let i = (layout.height - LABEL_HEIGHT) * layout.width; i < footer.length; i++) if (!footer[i]) pixels.fill(0, i * channels, (i + 1) * channels);
+    if (channels === 3) {
+      // Ordered calibration swatches are outside every QR quiet zone.
+      for (let swatch = 0; swatch < layout.palette.length; swatch++) {
+        const x0 = Math.floor(swatch * layout.width / layout.palette.length), x1 = Math.floor((swatch + 1) * layout.width / layout.palette.length);
+        for (let y = layout.contentHeight + 4; y < layout.contentHeight + 24; y++) for (let x = x0 + 2; x < x1 - 2; x++) {
+          for (let channel = 0; channel < 3; channel++) pixels[(y * layout.width + x) * 3 + channel] = layout.palette[swatch][channel];
+        }
+      }
+    }
+    const name = `sheet-${String(page.page).padStart(3, '0')}.png`;
+    await writeFile(join(output, name), pngFrom(pixels, layout.width, layout.height, channels));
     images.push(name);
-    console.error(`Saved ${name} (${end - first} parts)`);
+    console.error(`Saved ${name} (${page.parts} parts, ${page.physicalTiles} physical tiles)`);
   }
-  await writeFile(join(output, 'manifest.json'), JSON.stringify({ format: 'MSP1', ...info, transfer: hash(packet).subarray(0, 16).toString('hex'), layout, images, tiles }, null, 2) + '\n');
+  await writeFile(join(output, 'manifest.json'), JSON.stringify({ format: 'MSP1', manifestVersion: 2, appVersion: APP_VERSION, codec: layout.codec, layers: layout.layers, palette: layout.palette, preset: layout.preset, experimental: layout.experimental, ...info, transfer: hash(packet).subarray(0, 16).toString('hex'), layout, images, tiles }, null, 2) + '\n');
   if (values.show) await show(output, values);
 }
 
@@ -468,7 +521,8 @@ function rectify(image, points, width, height) {
     equations.push([x,y,1,0,0,0,-u*x,-u*y,u], [0,0,0,x,y,1,-v*x,-v*y,v]);
   }
   const h = solve(equations);
-  const data = Buffer.alloc(width * height, 255);
+  const channels = image.channels ?? 1;
+  const data = Buffer.alloc(width * height * channels, 255);
   for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
     const denominator = h[6]*x + h[7]*y + 1;
     const u = (h[0]*x + h[1]*y + h[2]) / denominator;
@@ -476,15 +530,90 @@ function rectify(image, points, width, height) {
     const sx = Math.floor(u), sy = Math.floor(v);
     if (sx < 0 || sy < 0 || sx + 1 >= image.width || sy + 1 >= image.height) continue;
     const dx = u - sx, dy = v - sy, offset = sy * image.width + sx;
-    data[y * width + x] = Math.round(image.data[offset]*(1-dx)*(1-dy) + image.data[offset+1]*dx*(1-dy) + image.data[offset+image.width]*(1-dx)*dy + image.data[offset+image.width+1]*dx*dy);
+    for (let channel = 0; channel < channels; channel++) data[(y * width + x) * channels + channel] = Math.round(image.data[offset*channels+channel]*(1-dx)*(1-dy) + image.data[(offset+1)*channels+channel]*dx*(1-dy) + image.data[(offset+image.width)*channels+channel]*(1-dx)*dy + image.data[(offset+image.width+1)*channels+channel]*dx*dy);
   }
-  return { data, width, height };
+  return { data, width, height, channels };
 }
 
 function crop(image, x, y, width, height) {
-  const data = Buffer.alloc(width * height);
-  for (let row = 0; row < height; row++) image.data.copy(data, row * width, (y + row) * image.width + x, (y + row) * image.width + x + width);
-  return { data, width, height };
+  const channels = image.channels ?? 1, data = Buffer.alloc(width * height * channels);
+  for (let row = 0; row < height; row++) image.data.copy(data, row * width * channels, ((y + row) * image.width + x) * channels, ((y + row) * image.width + x + width) * channels);
+  return { data, width, height, channels };
+}
+
+function colorPlanes(image) {
+  const count = image.width * image.height, planes = Array.from({ length: 3 }, () => Buffer.alloc(count));
+  let chroma = 0;
+  for (let i = 0; i < count; i++) {
+    const r = image.data[i*3], g = image.data[i*3+1], b = image.data[i*3+2];
+    planes[0][i] = r; planes[1][i] = g; planes[2][i] = b;
+    if (Math.max(r,g,b) - Math.min(r,g,b) > 24) chroma++;
+  }
+  return chroma > count / 1000 ? planes.map(data => ({ ...image, data, channels: 1 })) : [];
+}
+
+function calibrationFor(image) {
+  // Find the ordered footer in the full oriented sheet rather than assuming a
+  // pixel offset. This preserves calibration after arbitrary uniform resizing.
+  if (image.height < 128 || image.channels !== 3) return null;
+  const step = Math.max(1, Math.floor(image.height / 540));
+  for (let y = image.height - 2; y >= Math.floor(image.height * 0.75); y -= step) {
+    for (const layers of [3, 2]) {
+      let uniform = true;
+      const colors = Array.from({ length: 1 << layers }, (_, swatch) => {
+        const sums = [0,0,0], low = [255,255,255], high = [0,0,0]; let count = 0;
+        for (const fraction of [0.3, 0.5, 0.7]) {
+          const cx = Math.floor((swatch + fraction) * image.width / (1 << layers));
+          for (let sy = y - 1; sy <= y + 1; sy++) for (let x = cx - 1; x <= cx + 1; x++) {
+            for (let c = 0; c < 3; c++) {
+              const value = image.data[(sy * image.width + x)*3+c];
+              sums[c] += value; low[c] = Math.min(low[c],value); high[c] = Math.max(high[c],value);
+            }
+            count++;
+          }
+        }
+        if (low.some((value,c) => high[c]-value > 36)) uniform = false;
+        return sums.map(value => value / count);
+      });
+      if (!uniform) continue;
+      const white = colors[0], vectors = Array.from({length: layers}, (_, layer) => white.map((value,c) => value-colors[1<<layer][c]));
+      if (vectors.some(vector => Math.hypot(...vector) < 60)) continue;
+      let residual = 0;
+      for (let mask = 0; mask < colors.length; mask++) for (let c = 0; c < 3; c++) {
+        let predicted = white[c];
+        for (let l = 0; l < layers; l++) if (mask & (1<<l)) predicted -= vectors[l][c];
+        residual = Math.max(residual, Math.abs(predicted-colors[mask][c]));
+      }
+      if (residual > 32) continue;
+      const matrix = vectors.map((v,i) => [...vectors.map(w => v.reduce((sum,x,c) => sum+x*w[c],0)), ...Array.from({length:layers},(_,j)=>i===j?1:0)]);
+      let valid = true;
+      for (let i = 0; i < layers; i++) {
+        let pivot = i;
+        for (let j=i+1;j<layers;j++) if(Math.abs(matrix[j][i])>Math.abs(matrix[pivot][i])) pivot=j;
+        [matrix[i],matrix[pivot]]=[matrix[pivot],matrix[i]];
+        if (Math.abs(matrix[i][i]) < 100) { valid = false; break; }
+        const divisor = matrix[i][i]; matrix[i] = matrix[i].map(value=>value/divisor);
+        for (let j = 0; j < layers; j++) if (j!==i) { const factor=matrix[j][i]; matrix[j]=matrix[j].map((value,k)=>value-factor*matrix[i][k]); }
+      }
+      if (!valid) continue;
+      const weights = matrix.map(row => [0,1,2].map(c => vectors.reduce((sum,v,j)=>sum+row[layers+j]*v[c],0)));
+      return { white, weights };
+    }
+  }
+  return null;
+}
+
+function calibratedPlanes(image, calibration) {
+  if (!calibration || image.channels !== 3) return [];
+  const { white, weights } = calibration;
+  return weights.map(weight => {
+    const data=Buffer.alloc(image.width*image.height);
+    for(let i=0;i<data.length;i++) {
+      const darkness=weight.reduce((sum,w,c)=>sum+w*(white[c]-image.data[i*3+c]),0);
+      data[i]=Math.max(0,Math.min(255,Math.round(255*(1-darkness))));
+    }
+    return {...image,data,channels:1};
+  });
 }
 
 function rgba(image) {
@@ -534,19 +663,29 @@ async function restore(paths, values) {
       groups.set(frame.transfer, group);
     }
   };
-  const scan = async image => accept(await api.readBarcodes(rgba(image), { tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, maxNumberOfSymbols: 0 }));
+  const scanMono = async image => accept(await api.readBarcodes(rgba(image), { tryHarder: true, tryRotate: true, tryInvert: true, tryDownscale: true, maxNumberOfSymbols: 0 }));
+  let calibration = null;
+  const scan = async image => {
+    if (image.channels === 3) {
+      const mono = Buffer.alloc(image.width*image.height);
+      for (let i=0;i<mono.length;i++) mono[i]=Math.round(image.data[i*3]*0.299+image.data[i*3+1]*0.587+image.data[i*3+2]*0.114);
+      await scanMono({...image,data:mono,channels:1});
+      for (const plane of [...colorPlanes(image), ...calibratedPlanes(image, calibration)]) await scanMono(plane);
+    } else await scanMono(image);
+  };
   for (const file of files) {
     const points = cornerMap?.[basename(file)];
-    const pipeline = sharp(file, { limitInputPixels: 80_000_000 }).rotate().removeAlpha().greyscale();
+    const pipeline = sharp(file, { limitInputPixels: 80_000_000 }).rotate().flatten({ background: '#ffffff' }).toColourspace('srgb').removeAlpha();
     if (scanWidth && !points) pipeline.resize({ width: scanWidth, height: scanWidth, fit: 'inside', withoutEnlargement: true });
     const loaded = await pipeline.raw().toBuffer({ resolveWithObject: true });
-    let image = { data: loaded.data, width: loaded.info.width, height: loaded.info.height };
+    let image = { data: loaded.data, width: loaded.info.width, height: loaded.info.height, channels: loaded.info.channels };
     if (points) image = rectify(image, points, integer(manifest.layout.width, 'manifest width', 128, 8192), integer(manifest.layout.height, 'manifest height', 128, 8192));
+    calibration = calibrationFor(image);
     await scan(image);
     if (!points && scanWidth && Math.max(image.width, image.height) >= scanWidth) {
       const side = Math.round(scanWidth * 2 / 3);
-      const smaller = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: 1 } }).resize({ width: side, height: side, fit: 'inside', withoutEnlargement: true }).raw().toBuffer({ resolveWithObject: true });
-      await scan({ data: smaller.data, width: smaller.info.width, height: smaller.info.height });
+      const smaller = await sharp(image.data, { raw: { width: image.width, height: image.height, channels: image.channels } }).resize({ width: side, height: side, fit: 'inside', withoutEnlargement: true }).raw().toBuffer({ resolveWithObject: true });
+      await scan({ data: smaller.data, width: smaller.info.width, height: smaller.info.height, channels: smaller.info.channels });
     }
     if (manifest && (points || image.width === manifest.layout.width && image.height === manifest.layout.height)) {
       const boxes = new Map(manifest.tiles.map(tile => [`${tile.x},${tile.y},${tile.size}`, tile]));
@@ -597,8 +736,12 @@ node matrix-sheets.mjs inspect input.txt [--pages N|auto --cell N|auto --level Q
 node matrix-sheets.mjs pack input.txt --out out [--pages N|auto --cell N|auto --level Q --show]
 node matrix-sheets.mjs restore photos --out restored.txt [--manifest out/manifest.json --corners corners.json]
 node matrix-sheets.mjs show out
-Defaults: text size selects the cell size; compressed size determines the number of sheets.
-          Explicit --pages and --cell values take priority.
+Defaults: standard Q, minimize sheets, then maximize cells (automatic minimum 2 px).
+          Explicit --pages, --cell, --version, --level and dimensions take priority.
+Presets: --preset standard|dense-experimental|color-experimental
+         --layers 2|3 (color only; automatic color cells >=3 px, explicit >=2 px)
+Inspect: --compare reports all presets under explicit constraints.
+node matrix-sheets.mjs version
 Options: --pages N|auto --cell N|auto --level L|M|Q|H --width N --height N
          --version N|auto --compression auto|none|gzip|brotli
          --scan-width N --transfer HEX --force --show --help`);
@@ -608,6 +751,7 @@ async function main() {
   const [command, ...argv] = process.argv.slice(2);
   const { values, files, explicit } = argumentsOf(argv);
   if (!command || command === 'help' || command === '--help' || values.help) return help();
+  if (command === 'version') return json({ version: APP_VERSION, entry: resolve(process.argv[1]) });
   if (['pack', 'inspect', 'show'].includes(command) && files.length !== 1) fail(`${command} requires one input path`);
   if (command === 'pack' || command === 'inspect') return pack(files[0], values, command === 'inspect', explicit);
   if (command === 'restore') { if (!files.length) fail('restore requires images or a directory'); return restore(files, values); }
